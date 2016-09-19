@@ -135,6 +135,11 @@ ngx_proxy_protocol_write(ngx_connection_t *c, u_char *buf, u_char *last)
         return NULL;
     }
 
+    /* The header is all there, just waiting to be passed on. */
+    if (c->proxy_protocol_header.data) {
+        return ngx_cpymem(buf, c->proxy_protocol_header.data, c->proxy_protocol_header.len);
+    }
+
     switch (c->sockaddr->sa_family) {
 
     case AF_INET:
