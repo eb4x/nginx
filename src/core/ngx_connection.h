@@ -148,6 +148,12 @@ struct ngx_connection_s {
     socklen_t           socklen;
     ngx_str_t           addr_text;
 
+    ngx_str_t proxy_protocol_header;
+    ngx_str_t proxy_protocol_src_addr;
+    ngx_str_t proxy_protocol_dst_addr;
+    ngx_str_t proxy_protocol_src_port;
+    ngx_str_t proxy_protocol_dst_port;
+
     ngx_str_t           proxy_protocol_addr;
     in_port_t           proxy_protocol_port;
 
@@ -226,3 +232,5 @@ void ngx_free_connection(ngx_connection_t *c);
 void ngx_reusable_connection(ngx_connection_t *c, ngx_uint_t reusable);
 
 #endif /* _NGX_CONNECTION_H_INCLUDED_ */
+
+// vim: et ts=4

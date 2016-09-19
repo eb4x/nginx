@@ -12,45 +12,66 @@
 u_char *
 ngx_proxy_protocol_read(ngx_connection_t *c, u_char *buf, u_char *last)
 {
-    size_t     len;
-    u_char     ch, *p, *addr, *port;
-    ngx_int_t  n;
+    /* Store offset and length into proxy protocol header,
+     * because we're just gonna memcpy the whole shebang */
 
-    p = buf;
+    size_t len;
+    int i;
+    u_char ch, *p;
+
+    struct {
+        size_t off;
+        size_t len;
+    } item[4];
+
+
     len = last - buf;
 
-    if (len < 8 || ngx_strncmp(p, "PROXY ", 6) != 0) {
-        goto invalid;
-    }
-
-    p += 6;
-    len -= 6;
-
-    if (len >= 7 && ngx_strncmp(p, "UNKNOWN", 7) == 0) {
-        ngx_log_debug0(NGX_LOG_DEBUG_CORE, c->log, 0,
-                       "PROXY protocol unknown protocol");
-        p += 7;
-        goto skip;
-    }
-
-    if (len < 5 || ngx_strncmp(p, "TCP", 3) != 0
-        || (p[3] != '4' && p[3] != '6') || p[4] != ' ')
-    {
-        goto invalid;
-    }
-
-    p += 5;
-    addr = p;
-
-    for ( ;; ) {
-        if (p == last) {
-            goto invalid;
+    /* Handle this special usecase, sizeof should be 15 */
+    if (len >= 15 && ngx_strncmp(buf, "PROXY UNKNOWN" CRLF, 15) == 0) {
+        c->proxy_protocol_header.data = ngx_pnalloc(c->pool, 15);
+        if (c->proxy_protocol_header.data == NULL) {
+            return NULL;
         }
 
-        ch = *p++;
+        c->proxy_protocol_header.len = 15;
+        ngx_memcpy(c->proxy_protocol_header.data, buf, len);
+        return buf + 15;
+    }
+
+    /* Smallest "valid" headers.
+     * "PROXY TCP4 1.1.1.1 2.2.2.2 1 2\r\n" 32 bytes
+     * "PROXY TCP6 :: :: 1 2\r\n"           22 bytes
+     */
+
+    if (len <= 11 || ngx_strncmp(buf, "PROXY TCP", 9) != 0 ||
+        (buf[9] != '4' && buf[9] != '6') || buf[10] != ' ') {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "proxy protocol header mismatch: \"%.*s\"", (int) (last - buf), buf);
+
+        return NULL;
+    }
+
+    p = buf + 11;
+
+    /* Here we'll parse src_addr, dst_addr, src_port and dst_port.
+     * They're all separated by a space (' '), and ends on a CR. */
+
+    item[0].off = 11; /* p - buf */
+    item[0].len = 0;
+
+    for (i = 0, ch = *p++; ch != CR; ch = *p++) {
+        if (p >= last) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "proxy protocol header ended unexpectedly: \"%.*s\"", (int) (last - buf), buf);
+            return NULL;
+        }
 
         if (ch == ' ') {
-            break;
+            i += 1;
+            item[i].off = p - buf;
+            item[i].len = 0;
+            continue;
         }
 
         if (ch != ':' && ch != '.'
@@ -58,71 +79,48 @@ ngx_proxy_protocol_read(ngx_connection_t *c, u_char *buf, u_char *last)
             && (ch < 'A' || ch > 'F')
             && (ch < '0' || ch > '9'))
         {
-            goto invalid;
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "proxy protocol header invalid character: \"%.*s\"", (int) (p - buf), buf);
+            return NULL;
         }
+
+        item[i].len++;
     }
 
-    len = p - addr - 1;
-    c->proxy_protocol_addr.data = ngx_pnalloc(c->pool, len);
-
-    if (c->proxy_protocol_addr.data == NULL) {
+    if (*p++ != LF) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "proxy protocol header missing LF: \"%.*s\"", (int) (p - buf), buf);
         return NULL;
     }
 
-    ngx_memcpy(c->proxy_protocol_addr.data, addr, len);
-    c->proxy_protocol_addr.len = len;
+    len = p - buf;
 
-    for ( ;; ) {
-        if (p == last) {
-            goto invalid;
-        }
-
-        if (*p++ == ' ') {
-            break;
-        }
+    c->proxy_protocol_header.data = ngx_pnalloc(c->pool, len);
+    if (c->proxy_protocol_header.data == NULL) {
+        return NULL;
     }
 
-    port = p;
+    c->proxy_protocol_header.len = len;
+    ngx_memcpy(c->proxy_protocol_header.data, buf, len);
 
-    for ( ;; ) {
-        if (p == last) {
-            goto invalid;
-        }
+    c->proxy_protocol_src_addr.data = c->proxy_protocol_header.data + item[0].off;
+    c->proxy_protocol_dst_addr.data = c->proxy_protocol_header.data + item[1].off;
+    c->proxy_protocol_src_port.data = c->proxy_protocol_header.data + item[2].off;
+    c->proxy_protocol_dst_port.data = c->proxy_protocol_header.data + item[3].off;
 
-        if (*p++ == ' ') {
-            break;
-        }
-    }
+    c->proxy_protocol_src_addr.len = item[0].len;
+    c->proxy_protocol_dst_addr.len = item[1].len;
+    c->proxy_protocol_src_port.len = item[2].len;
+    c->proxy_protocol_dst_port.len = item[3].len;
 
-    len = p - port - 1;
+    /* <legacy code> */
+    c->proxy_protocol_addr.data = c->proxy_protocol_header.data + item[0].off;
+    c->proxy_protocol_addr.len = item[0].len;
+    c->proxy_protocol_port = ngx_atoi(c->proxy_protocol_src_port.data, c->proxy_protocol_src_port.len);
+    /* </legacy code> */
 
-    n = ngx_atoi(port, len);
-
-    if (n < 0 || n > 65535) {
-        goto invalid;
-    }
-
-    c->proxy_protocol_port = (in_port_t) n;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                   "PROXY protocol address: %V %i", &c->proxy_protocol_addr, n);
-
-skip:
-
-    for ( /* void */ ; p < last - 1; p++) {
-        if (p[0] == CR && p[1] == LF) {
-            return p + 2;
-        }
-    }
-
-invalid:
-
-    ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                  "broken header: \"%*s\"", (size_t) (last - buf), buf);
-
-    return NULL;
+    return p;
 }
-
 
 u_char *
 ngx_proxy_protocol_write(ngx_connection_t *c, u_char *buf, u_char *last)
@@ -166,3 +164,5 @@ ngx_proxy_protocol_write(ngx_connection_t *c, u_char *buf, u_char *last)
 
     return ngx_slprintf(buf, last, " %ui %ui" CRLF, port, lport);
 }
+
+// vim: et ts=4
